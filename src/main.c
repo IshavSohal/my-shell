@@ -5,8 +5,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
-const char *SUPPORTED_COMMANDS[] = {"ls", "cat", "cd", "echo"};
-const int NUM_SUPPORTED = 4;
+// Array of char pointers. A string is a char pointer, so this is an array of strings
+const char *SUPPORTED_COMMANDS[] = {"ls", "cat", "cd", "echo", "pwd", "grep"};
+const int NUM_SUPPORTED = sizeof(SUPPORTED_COMMANDS) / sizeof(char *);
 const int MAX_COMMAND = 50; // Max number of tokens for a single command
 const char *COMMAND_DELIMITER = " ";
 
@@ -17,19 +18,14 @@ void run() {
     printf("mysh> ");
     fgets(x, sizeof(x), stdin);
     x[strcspn(x, "\n")] = '\0';
-    //printf("%s\n", x);
 
     // Parse user input, determine which valid command was executed, if any
     char *curr_token = strtok(x, COMMAND_DELIMITER);
-
-
+    
     if (curr_token != NULL){
-        // First token must be the name of a supported command
+        // First token must be the name of a supported command. Otherwise we cannot process user input
         bool is_supported = false;
-        //printf("curr_token: %s\n", curr_token);
-        for (int i = 0; i < NUM_SUPPORTED; i++){
-            //printf("Supported command: %s\n", SUPPORTED_COMMANDS[i]);
-            
+        for (int i = 0; i < NUM_SUPPORTED; i++){            
             if (strcmp(SUPPORTED_COMMANDS[i], curr_token) == 0){
                 is_supported = true;
                 break;
@@ -53,12 +49,19 @@ void run() {
         }
         command[currSize] = NULL;
 
-        // Run command by forking process and calling exec. Define a uni-directional pipe so that parent can read stdout of child
-        // int pipefd[2];
-        // if (pipe(pipefd) != 0){
-        //     fprintf(STDERR_FILENO, "Failed to create pipe");
-        //     return;
-        // }
+        // Since `cd` is meant to alter the state of the shell, it cannot be deferred to a
+        // child process. The current working directory should be changed to the path provided 
+        // by the user
+        if (strcmp(command[0], "cd") == 0){
+            if (command[2] != NULL){
+                fprintf(stderr, "Too many or too few arguments for cd command\n");
+                return;
+            } 
+            printf("running cd\n");
+            printf("%s\n", command[1]);
+            chdir(command[1]); // first argument should be the path
+            return;
+        }
 
         pid_t pid = fork();
 
@@ -66,14 +69,11 @@ void run() {
             fprintf(stderr, "Failed to fork process");
             return;
         }
-        else if (pid == 0){
-            // Child process executes command, and sents output back to parent process using the pipe
-            //close(pipefd[0]);            
+        // The child process calls exec to run the command. This repla
+        else if (pid == 0){         
             execvp(command[0], command);
         } 
         else{
-            // parent process reads stdout from child process and outputs it to the command line
-            //close(pipefd[1]);
             int status;
             waitpid(pid, &status, 0);
         }
