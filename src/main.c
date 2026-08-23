@@ -1,9 +1,11 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <ctype.h>
 
 // Array of char pointers. A string is a char pointer, so this is an array of strings
 const char *SUPPORTED_COMMANDS[] = {"ls", "cat", "cd", "echo", "pwd", "grep"};
@@ -11,10 +13,16 @@ const int NUM_SUPPORTED = sizeof(SUPPORTED_COMMANDS) / sizeof(char *);
 const int MAX_COMMAND = 50; // Max number of tokens for a single command
 const char *COMMAND_DELIMITER = " ";
 const char *PIPE_DELIMITER = "|";
+pid_t parent_id; 
 
 
 // Used to run an individual command. This is executed by a child process, so no need to fork in here
+// NOTE: processes than run this command will have stdout redirected to the write end of a pipe (except for 
+// the last such process). So, we cannot print to stdout here, only to stderr in the case of errors
 void run_command(char* command_str){ 
+    fprintf(stderr, "\nrun_command()");
+    fprintf(stderr,"\n%s\n", command_str);
+    fprintf(stderr, "Process ID: %d\n", getpid());
     // Parse user input, determine which valid command was executed, if any
     char *token_ptr;
     char *curr_token = strtok_r(command_str, COMMAND_DELIMITER, &token_ptr);
@@ -31,8 +39,8 @@ void run_command(char* command_str){
         
         // Avoid invalid commands
         if (!is_supported){
-            fprintf(stderr, "Not a supported command\n");
-            return;
+            perror("Not a supported command");
+            exit(1);
         }        
     }
 
@@ -53,87 +61,105 @@ void run_command(char* command_str){
     // by the user
     if (strcmp(command[0], "cd") == 0){
         if (command[2] != NULL){
-            fprintf(stderr, "Too many or too few arguments for cd command\n");
+            perror("Too many or too few arguments for cd command");
             return;
         } 
-        printf("running cd\n");
-        printf("%s\n", command[1]);
+        //printf("running cd\n");
+        //printf("%s\n", command[1]);
         chdir(command[1]); // first argument should be the path
-        return;
+        exit(0);
     }
 
     // The child process calls exec to run the command
     execvp(command[0], command);
 }
 
-// Prompt user to enter a command
-void run() {
-    char x[50];
-    printf("mysh> ");
-    fgets(x, sizeof(x), stdin);
-    x[strcspn(x, "\n")] = '\0';
+// Run a command with two or more commands piped together
+void run_piped(char* piped_command){
+    fprintf(stderr, "\nrun_piped()");
+    fprintf(stderr,"\n%s", piped_command);
+    fprintf(stderr,"\nProcess ID: %d", getpid());
 
     // If there are pipes in the command, we must split on then, and run each command seperately
-    char *token_ptr;
-    char *individual_command = strtok_r(x, PIPE_DELIMITER, &token_ptr);
+    // We split on the first occurance of |. We execute the first part as it, and recursively process the 
+    // second part, since it may contain more pipes    
+    char *first_pipe = strchr(piped_command, PIPE_DELIMITER[0]);
+    char *command1 = piped_command;
+    char *command2 = NULL;
 
-    // For now assume there are only two commands
-    if (individual_command == NULL){
-        return;
+    // If there is a pipe in the command, we replace it with a null terminator
+    if (first_pipe != NULL){
+        *first_pipe = '\0';
+        command2 = first_pipe + 1;
     }
 
-    char *command1 = individual_command;
-    char *command2 = strtok_r(NULL, PIPE_DELIMITER, &token_ptr);
-    printf("%s\n", command1);
-    //printf("%s\n", command2);
+    fprintf(stderr,"\ncommand 1: %s", command1);
+    while (command2 != NULL && isspace(*command2)){
+        command2++;
+        fprintf(stderr,"\ncommand 2: %s", command2);
+    }   
+    
+    // if (command2 != NULL){
+    //     run_piped(command2);
+    // }
 
+    // return;
 
-    // If there is only one command, just fork one time and run the command
+    // If there is only one command, just fork one time and run the command.
+    // Forking is only necessary if the (original) parent is calling this function. Otherwise, if its a child,
+    // it can just call run_command directly. 
     if (command2 == NULL){
-        pid_t pid = fork();
+        if (getpid() == parent_id){
+            pid_t pid = fork();
 
-        if (pid == -1){
+            if (pid == -1){
+                return;
+            }
+
+            // Child process.
+            else if (pid == 0){
+                run_command(command1);            
+            }
+
+            // Parent process. Wait for child process to complete execution
+            else{
+                int status;
+                pid_t res = waitpid(pid, &status, 0);
+
+                if (res == -1){
+                    perror("\nChild process 1 failed");
+                }
+            }
             return;
-        }
-
-        // Child process
-        else if (pid == 0){
+        } else{
             run_command(command1);
         }
-
-        // Parent process. Wait for child process to complete execution
-        else{
-            int status;
-            pid_t res = waitpid(pid, &status, 0);
-
-            if (res == -1){
-                perror("Child process 1 failed");
-            }
-        }
-
-        return;
     }
-
 
     int pipefd[2];
     int pipe_res = pipe(pipefd);
 
     if (pipe_res == -1){
+        perror("Failed to create pipe");
+        if (getpid() != parent_id) exit(1); // May be a child process
         return;
     }
 
     pid_t pid = fork();
 
     if (pid == -1){
+        perror("Failed to fork process");
+        if (getpid() != parent_id) exit(1); // May be a child process
         return;
     }
 
-    // First child process. Set stdout to write end of pipe. Close the read end
+    // First child process. Set stdout to write end of pipe. Close the read end. We can call run_command directly here, 
+    // since this command is guaranteed to be a single command (i.e. this command will not have any pipes in it)
     else if (pid == 0){
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
-        run_command(command1);
         close(pipefd[1]);
+        run_command(command1);   
     }
 
     // Parent process. Wait for first child process to complete execution. Close write end of pipe. Then execute second command in new child process
@@ -144,42 +170,74 @@ void run() {
         pid_t res = waitpid(pid, &status, 0);    
     
         if (res == -1){
-            perror("Child process 1 failed");
+            perror("\nChild process 1 failed");
         }
         
         pid_t pid2 = fork();
 
         if (pid2 == -1){
+            perror("Failed to fork process");
+            if (getpid() != parent_id) exit(1); // May be a child process
             return;
         }
 
-        // Second hild process. Set stdin to read end of pipe.
+        // Second child process. Set stdin to read end of pipe. We then close pipefd[0] since its now redundant. stdin closes itself once the process
+        // is terminated. Since this command MAY have multiple pipes in it, we recursively call run_piped().
         else if (pid2 == 0){
             dup2(pipefd[0], STDIN_FILENO);
-            run_command(command2);
             close(pipefd[0]);
+            run_piped(command2);          
         }
 
-        // Parent. Wait for second child to complete execution
+        // Parent. Wait for second child to complete execution. Since this case can be reached by a child (when a child calls run_piped() with a piped
+        // command), we need to handle this case by comparing if the current process' PID matches the original parent or not
         else{
+            close(pipefd[0]);
             int status2;
             pid_t res2 = waitpid(pid2, &status2, 0);    
         
             if (res2 == -1){
-                perror("Child process 2 failed");
-            }        
-            close(pipefd[0]);
+                perror("Child process failed");
+                if (getpid() != parent_id) exit(1);              
+            }
+
+            if (getpid() != parent_id) exit(0);         
         }
     }    
 
     return;
 }
 
+// Prompt user to enter a command
+// Each call to run() exists on a seperate stack frame. However, each stack frame for a run() call is placed in the same 
+// location in the stack (right above main()), so char x[50] is also placed in the same location as the previous call to 
+// run(). If fgets reads nothing and hits an EOF, x will still point to the same data as the previous run, which would be the
+// previous-most command that was processed. 
+void run() {
+    fprintf(stderr,"\nrun()\n");
+    parent_id = getpid();
+    fprintf(stderr,"Process ID: %d\n", parent_id);
+    char x[100];
+    fprintf(stderr,"mysh> ");
+    char * res = fgets(x, sizeof(x), stdin);
+
+    // If there is no input, return to calling location, which will reprompt user for input
+    if (res == NULL){
+        return;
+    }
+
+    x[strcspn(x, "\n")] = '\0';
+    run_piped(x);    
+    return;    
+}
+
 
 
 int main () {
-    while (true){
+    int x = 0;
+    while (x < 10){
         run();
+        x += 1;
     }
     
     return 0;
