@@ -7,6 +7,7 @@
 #include <sys/wait.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <termios.h>
 
 // Array of char pointers. A string is a char pointer, so this is an array of strings
 const char *SUPPORTED_COMMANDS[] = {"ls", "cat", "cd", "echo", "pwd", "grep"};
@@ -18,6 +19,24 @@ const char *OUTPUT_REDIR_DELIM = ">";
 const char *OUTPUT_REDIR_DELIM2 = ">>";
 const char *INPUT_REDIR_DELIM = "<";
 pid_t parent_id; 
+
+// Used to save command history
+const int NUM_COMMANDS = 50;
+char *command_history[NUM_COMMANDS];
+int saved_commands = 0;
+
+
+void custom_perror(char* error){
+    perror(error);
+    printf("\r");
+    fflush(stdout);
+}
+
+// Direction is 1 for up and -1 for down
+char *get_history(int direction){
+    int index = saved_commands + direction % NUM_COMMANDS;
+    return command_history[saved_commands];
+}
 
 
 // Used to run an individual command. This is executed by a child process, so no need to fork in here
@@ -109,7 +128,7 @@ void run_command(char* command_str){
         
         // Avoid invalid commands
         if (!is_supported){
-            perror("Not a supported command");
+            custom_perror("Not a supported command");
             exit(1);
         }        
     }
@@ -131,7 +150,7 @@ void run_command(char* command_str){
     // by the user
     if (strcmp(command[0], "cd") == 0){
         if (command[2] != NULL){
-            perror("Too many or too few arguments for cd command");
+            custom_perror("Too many or too few arguments for cd command");
             return;
         } 
         //printf("running cd\n");
@@ -153,7 +172,7 @@ void run_command(char* command_str){
         int fd = open(output_file, flags, S_IRWXU);
 
         if (fd == -1){
-            perror("\nFailed to open output file");
+            custom_perror("\nFailed to open output file");
             return;
         }
 
@@ -165,15 +184,71 @@ void run_command(char* command_str){
         int fd = open(input_file, O_RDONLY, S_IRWXU);
 
         if (fd == -1){
-            perror("\nFailed to open input file");
+            custom_perror("\nFailed to open input file");
             return;
         }
 
         dup2(fd, STDIN_FILENO);
     }
 
+    // If stdout is pointing to the terminal, we need to replace each \n with \r\n, since we're in Raw mode. We do 
+    // this by writing the output to a pipe, rather than stdout. Then, we have another process run 
+    // "sed -z 's/\n/\r\n/g'" to replace each \n with \r\n, then have that process write to stdout.
+    // If stdout is pointing elsewhere, do nothing, since Raw mode is only applied to the terminal
+    if (isatty(STDOUT_FILENO)){        
+        int pipefd[2];
+        int pipe_res = pipe(pipefd);
 
-    execvp(command[0], command);
+        if (pipe_res == -1){
+            custom_perror("Failed to create pipe");
+            exit(1);
+        }
+
+        pid_t pid = fork();
+        
+        if (pid == -1){
+            custom_perror("Failed to fork process");
+            exit(1); // May be a child process
+        }
+
+        // Child process. Set stdout to write end of pipe. Close the read fd of the pipe.
+        // This process will execute the command itself
+        else if (pid == 0){
+            printf("child process 2 about to run command \r\n");
+            close(pipefd[0]);
+            dup2(pipefd[1], STDOUT_FILENO);
+            close(pipefd[1]);
+            execvp(command[0], command);  
+        }
+
+        // Parent process. Close the write fd of the pipe. Redirect stdin to the read end of the pipe, then close the read fd of the pipe as well.
+        // Wait for first child process to complete execution. Close write end of pipe. Then execute the sed command in new child process. 
+        // This output is what will be written to stdout
+        else {
+            close(pipefd[1]);
+            dup2(pipefd[0], STDIN_FILENO);
+            close(pipefd[0]);
+
+            int status;
+            pid_t res = waitpid(pid, &status, 0);
+
+            if (res == -1){
+                custom_perror("\nChild process failed");
+                exit(1);
+            }
+
+            char *sed_args[] = {"sed", "s/$/\\r/g", NULL};
+            execvp(sed_args[0], sed_args); 
+            custom_perror("Failed to exec on sed command");
+            exit(1);
+        }
+
+    } else{
+        execvp(command[0], command);
+        custom_perror("Failed to exec on sed command");
+        exit(1);
+    }
+  
 }
 
 
@@ -215,7 +290,7 @@ void run_piped(char* piped_command){
 
             // Child process.
             else if (pid == 0){
-                run_command(command1);            
+                run_command(command1); 
             }
 
             // Parent process. Wait for child process to complete execution
@@ -224,10 +299,10 @@ void run_piped(char* piped_command){
                 pid_t res = waitpid(pid, &status, 0);
 
                 if (res == -1){
-                    perror("\nChild process failed");
-                }
+                    custom_perror("\nChild process failed");
+                }                
             }
-            return;
+            return;            
         } else{
             run_command(command1);
         }
@@ -237,7 +312,7 @@ void run_piped(char* piped_command){
     int pipe_res = pipe(pipefd);
 
     if (pipe_res == -1){
-        perror("Failed to create pipe");
+        custom_perror("Failed to create pipe");
         if (getpid() != parent_id) exit(1); // May be a child process
         return;
     }
@@ -245,7 +320,7 @@ void run_piped(char* piped_command){
     pid_t pid = fork();
 
     if (pid == -1){
-        perror("Failed to fork process");
+        custom_perror("Failed to fork process");
         if (getpid() != parent_id) exit(1); // May be a child process
         return;
     }
@@ -267,13 +342,13 @@ void run_piped(char* piped_command){
         pid_t res = waitpid(pid, &status, 0);    
     
         if (res == -1){
-            perror("\nChild process failed");
+            custom_perror("\nChild process failed");
         }
         
         pid_t pid2 = fork();
 
         if (pid2 == -1){
-            perror("Failed to fork process");
+            custom_perror("Failed to fork process");
             if (getpid() != parent_id) exit(1); // May be a child process
             return;
         }
@@ -294,7 +369,7 @@ void run_piped(char* piped_command){
             pid_t res2 = waitpid(pid2, &status2, 0);    
         
             if (res2 == -1){
-                perror("Child process failed");
+                custom_perror("Child process failed");
                 if (getpid() != parent_id) exit(1);              
             }
 
@@ -312,25 +387,112 @@ void run_piped(char* piped_command){
 // run(). If fgets reads nothing and hits an EOF, x will still point to the same data as the previous run, which would be the
 // previous-most command that was processed. 
 void run() {
-    //fprintf(stderr,"\nrun()\n");
     parent_id = getpid();
-    //fprintf(stderr,"Process ID: %d\n", parent_id);
-    char x[100];
+    char buffer[1000];
+    char c; // Used to store the character most recently read
+    int i = 0; // number of characters read into the buffer thus far    
+
+    // By default, stdout is line-buffered when it is connected to a terminal. That is, what we write to stdout is buffered until 
+    // a newline is received, or once the buffer is filled up. fflush() will flush everything buffered in stdout into its destination file/location, 
+    // which in this case is the terminal
     printf("mysh> ");
-    char * res = fgets(x, sizeof(x), stdin);
+    fflush(stdout);
+
+    while (read(STDIN_FILENO, &c, 1) == 1){
+        // Handle Enter press
+        if (c == 10 || c == 13){
+            buffer[i] = '\0';
+            printf("\r\n");
+            break;
+        }
+
+        // Handle backspace press
+        if (c == 127 || c == 8){
+            // Prevents user from deleting the system prompt itself
+            if (i > 0) {
+                i -= 1;
+                printf("\b \b");
+                fflush(stdout);                
+            }
+            continue;            
+        }
+
+        // For up arrow, move to next position in history array, replace whats in the current line of the terminal with this command,
+        // and also replace the contents of the buffer with this command
+        if (c == 8593){
+            char *history_command = get_history(1);
+
+        }
+
+        // TODO: handle left/right arrow press for changing cursor position
+
+        // TODO: shift characters to the right of the typing location, rather than replacing them
+
+        buffer[i] = c;
+        i += 1;
+        printf("%c", c); // echo the character to the terminal
+        fflush(stdout); 
+    }
 
     // If there is no input, return to calling location, which will reprompt user for input
-    if (res == NULL){
+    if (i == 0){
         return;
     }
 
-    x[strcspn(x, "\n")] = '\0';
-    run_piped(x);    
+    command_history[saved_commands] = buffer;
+
+    if (saved_commands == NUM_COMMANDS - 1){
+        saved_commands = 0;
+    }
+
+    run_piped(buffer);    
     return;    
+}
+
+// Used to switch from Canonical mode to Raw mode. This essentially disables a lot of the responsibilities of the TTY (backspace, echoing back 
+// to terminal, etc.), thus requiring this shell program to handle those responsibilities.
+void enable_raw_mode(){
+    struct termios raw;
+
+    // Get the file descriptor for the teletypewriter (tty), which the terminal is guaranteed to be connected to
+    // When we open /dev/tty, the tty driver will resolve this request to the terminal that was used to run this shell program
+    // This ensures that even if stdin/out/err get redirected (somehow), that this function can still access the terminal
+    int fd = open("/dev/tty", O_RDWR);
+
+    if (fd == -1){
+        custom_perror("open");
+        return;
+    }
+
+    // Get the current terminal settings, and store them in raw.
+    if (tcgetattr(fd, &raw) == -1){
+        custom_perror("tcgetattr");
+        return;
+    }
+
+    // Disable canonical mode (line buffering) and echo. This prevents characters written by the user in the terminal to actually 
+    // appear in the terminal. The TTY will not automatically echo the characters back anymore. This is something we have to manually
+    // do in the shell program
+    raw.c_lflag &= ~(ICANON | ECHO);
+
+    // Disable input processing (ex. ctrl+c, ctrl+z, CR to NL)
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+
+    // Disable output post-processing
+    raw.c_oflag &= ~(OPOST);
+    raw.c_cflag |= (CS8);
+
+    // Apply changes to the terminal
+    if (tcsetattr(fd, TCSANOW, &raw) == -1){
+        custom_perror("tcsetattr");
+    }
 }
 
 
 int main () {
+    enable_raw_mode(); // switch from canonical to raw mode
+
+    // For debugging purposes only
     int x = 0;
     while (x < 10){
         run();
