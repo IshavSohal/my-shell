@@ -1,3 +1,7 @@
+## my-shell
+
+C program that emulates a Linux shell
+
 Features
 - Basic linux commands
    - ls
@@ -22,5 +26,7 @@ Features
 - Add support for foreground/background process execution
 
 - Input/output redirection
+
+- Add support for command history
 
 - 
