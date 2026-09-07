@@ -9,6 +9,9 @@
 #include <fcntl.h>
 #include <termios.h>
 
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define MOD(a, b) (((a) % (b) + (b)) % (b))      
+
 // Array of char pointers. A string is a char pointer, so this is an array of strings
 const char *SUPPORTED_COMMANDS[] = {"ls", "cat", "cd", "echo", "pwd", "grep"};
 const int NUM_SUPPORTED = sizeof(SUPPORTED_COMMANDS) / sizeof(char *);
@@ -20,11 +23,10 @@ const char *OUTPUT_REDIR_DELIM2 = ">>";
 const char *INPUT_REDIR_DELIM = "<";
 pid_t parent_id; 
 
-// Used to save command history
-const int NUM_COMMANDS = 50;
-char *command_history[NUM_COMMANDS];
-int saved_commands = 0;
-
+// TODO: define a struct for the history variables
+enum {NUM_COMMANDS = 50, BUFFER_SIZE=200};
+char **command_history;
+int command_idx = 0;
 
 void custom_perror(char* error){
     perror(error);
@@ -32,10 +34,24 @@ void custom_perror(char* error){
     fflush(stdout);
 }
 
-// Direction is 1 for up and -1 for down
-char *get_history(int direction){
-    int index = saved_commands + direction % NUM_COMMANDS;
-    return command_history[saved_commands];
+// Gets the next position in the command_history array, with direction considered. Wrapping is handled. 1 is up, -1 is down
+int get_history_index(int position, int direction){
+    //printf("poition: %d\r\n", position);
+    //printf("direction: %d\r\n", direction);
+    int index = MOD((position - (direction)), NUM_COMMANDS);
+    //printf("index: %d\r\n", index);
+
+    return index;
+}
+
+// Returns the next position in the history array to add a command. Wrapping is handled
+// If this is the first command being stored, we store it at `command_idx`. Otherwise we increment
+// command_idx (with wrapping) and store it at the resulting location
+int next_history_index(){
+    if (strlen(command_history[command_idx]) != 0){
+        command_idx = MOD((command_idx + 1), NUM_COMMANDS);
+    }    
+    return command_idx;
 }
 
 
@@ -214,7 +230,6 @@ void run_command(char* command_str){
         // Child process. Set stdout to write end of pipe. Close the read fd of the pipe.
         // This process will execute the command itself
         else if (pid == 0){
-            printf("child process 2 about to run command \r\n");
             close(pipefd[0]);
             dup2(pipefd[1], STDOUT_FILENO);
             close(pipefd[1]);
@@ -388,9 +403,12 @@ void run_piped(char* piped_command){
 // previous-most command that was processed. 
 void run() {
     parent_id = getpid();
-    char buffer[1000];
+    char buffer[BUFFER_SIZE];
     char c; // Used to store the character most recently read
-    int i = 0; // number of characters read into the buffer thus far    
+    int i = 0; // number of characters read into the buffer thus far  
+
+    // For keeping track of which historical command we're on for the current run(). A value of -1 means no history command is selected
+    int history_index = -1;  
 
     // By default, stdout is line-buffered when it is connected to a terminal. That is, what we write to stdout is buffered until 
     // a newline is received, or once the buffer is filled up. fflush() will flush everything buffered in stdout into its destination file/location, 
@@ -417,39 +435,153 @@ void run() {
             continue;            
         }
 
-        // For up arrow, move to next position in history array, replace whats in the current line of the terminal with this command,
-        // and also replace the contents of the buffer with this command
-        if (c == 8593){
-            char *history_command = get_history(1);
+        // For up arrow key, move to next position in history array, replace whats in the current line of the terminal with this command,
+        // and also replace the contents of the buffer with this command. The terminal escape sequence for the keys on the right side of 
+        // the keyboard is: \e or ^[. Once this is identified, we need to determine what key is pressed
+        // Input for up arrow: ^[ [ A
+        // Input for down arrow: ^[ [ B
+        // Input for left arrow: ^[ [ C
+        // Input for down arrow: ^[ [ D
+        if (c == '\x1b'){       
+            char char_seq[10];
+            int j = 0;
 
+            if (read(STDIN_FILENO, &c, 1) == 1){
+                char_seq[j] = c;
+                j += 1;
+            } 
+            
+            if (read(STDIN_FILENO, &c, 1) == 1){
+                char_seq[j] = c;
+                j += 1;
+            } 
+            char_seq[j] = '\0';
+
+            // Up arrow key
+            if (strcmp(char_seq, "[A") == 0){
+                if (history_index == -1){
+                    history_index = command_idx;
+                } else{
+                    history_index = get_history_index(history_index, 1);
+                }
+                //printf("history index: %d\r\n", history_index);
+                char *history_command = command_history[history_index];
+                int k = 0;
+
+                // Calloc sets the bytes of allocated memory to 0, but the strlen is 0, because
+                // no chars are identified
+                if (strlen(history_command) != 0){
+                    // Clear the currently written command in the terminal
+                    while (i > 0) {
+                        i -= 1;
+                        printf("\b \b");
+                        fflush(stdout);                
+                    }
+
+                    // Update buffer to reflect the history command. Rather than having the buffer point to the 
+                    // history command, we set the chars of the buffer one at a time. 
+                    while (history_command[k] != '\0'){
+                        buffer[k] = history_command[k];
+                        k += 1;
+                    }
+                    buffer[k] = '\0';
+                    i = k;
+                
+                    printf("%s", buffer);
+                    fflush(stdout);
+                } else{ // Reset history_index to original value, or back to -1 if the history array is empty
+                    history_index = (history_index != command_idx) ? get_history_index(history_index, -1) : -1;
+                }
+            }
+
+            // Down arrow key. This allows users to go back to previous commands in the history array that have already been traversed
+            // in the current run(). If history_index is -1, do nothing, as there are no other history commands to traverse.
+            // If history_index is command_idx, we set the text in the terminal to empty, to allow the user to type a new command without
+            // having to manually delete chars of a historical command
+            if (strcmp(char_seq, "[B") == 0 && history_index != -1){
+                if (history_index == command_idx){
+                    // Clear the currently written command in the terminal
+                    while (i > 0) {
+                        i -= 1;
+                        printf("\b \b");
+                        fflush(stdout);                
+                    }
+                    history_index = -1;
+                } else{
+                    history_index = get_history_index(history_index, -1);
+                    char *history_command = command_history[history_index];
+                    int k = 0;
+        
+                    // Clear the currently written command in the terminal
+                    while (i > 0) {
+                        i -= 1;
+                        printf("\b \b");
+                        fflush(stdout);                
+                    }
+
+                    // Update buffer to reflect the history command. Rather than having the buffer point to the 
+                    // history command, we set the chars of the buffer one at a time. 
+                    while (history_command[k] != '\0'){
+                        buffer[k] = history_command[k];
+                        k += 1;
+                    }
+                    buffer[k] = '\0';
+                    i = k;
+                
+                    printf("%s", buffer);
+                    fflush(stdout);
+                }                
+            }
+
+            // left arrow key
+
+            // right arrow key
+
+            // delete key
+
+            // home key
+    
+            // end key
+
+            // insert key
+
+            // pg up key (same as up arrow key)
+
+            // pg down key (same as down arrow key)
+            continue;
+            //char *history_command = get_history(1);
         }
 
-        // TODO: handle left/right arrow press for changing cursor position
+        // TODO: handle left/right arrow press for changing cursor position. Prevent the cursor from moving into the system prompt, otherwise user would be
+        // able to delete it
 
         // TODO: shift characters to the right of the typing location, rather than replacing them
-
         buffer[i] = c;
-        i += 1;
+        i += 1;        
+        history_index = -1; // Once at least one character has been manually written, we exit "history mode" by resetting the history index
         printf("%c", c); // echo the character to the terminal
         fflush(stdout); 
     }
+
+    printf("Buffer: %s\r\n", buffer);
+    fflush(stdout);
 
     // If there is no input, return to calling location, which will reprompt user for input
     if (i == 0){
         return;
     }
 
-    command_history[saved_commands] = buffer;
-
-    if (saved_commands == NUM_COMMANDS - 1){
-        saved_commands = 0;
-    }
+    // Increment command_idx, then write whats in the buffer to that index. 
+    // TODO: When a history command is used, it gets written into the history array again
+    int history_write_index = next_history_index();
+    //printf("write index: %d \r\n", history_write_index);
+    strcpy(command_history[history_write_index], buffer);
 
     run_piped(buffer);    
     return;    
 }
 
-// Used to switch from Canonical mode to Raw mode. This essentially disables a lot of the responsibilities of the TTY (backspace, echoing back 
+// Used to switch from Canonical mode to Raw mode. This disables a lot of the responsibilities of the TTY (backspace, echoing back 
 // to terminal, etc.), thus requiring this shell program to handle those responsibilities.
 void enable_raw_mode(){
     struct termios raw;
@@ -488,9 +620,76 @@ void enable_raw_mode(){
     }
 }
 
+void disable_raw_mode(){
+    struct termios raw;
+
+    // Get the file descriptor for the teletypewriter (tty), which the terminal is guaranteed to be connected to
+    // When we open /dev/tty, the tty driver will resolve this request to the terminal that was used to run this shell program
+    // This ensures that even if stdin/out/err get redirected (somehow), that this function can still access the terminal
+    int fd = open("/dev/tty", O_RDWR);
+
+    if (fd == -1){
+        custom_perror("open");
+        return;
+    }
+
+    // Get the current terminal settings, and store them in raw.
+    if (tcgetattr(fd, &raw) == -1){
+        custom_perror("tcgetattr");
+        return;
+    }
+
+    // Enable canonical mode (line buffering) and echo. 
+    raw.c_lflag |= (ICANON | ECHO);
+
+    // Disable input processing (ex. ctrl+c, ctrl+z, CR to NL)
+    raw.c_iflag |= (BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+
+    // Disable output post-processing
+    raw.c_oflag |= (OPOST);
+    raw.c_cflag &= ~(CS8);
+
+    // Apply changes to the terminal
+    if (tcsetattr(fd, TCSANOW, &raw) == -1){
+        custom_perror("tcsetattr");
+    }
+}
+
+
+void cleanup(){
+    for (int i = 0; i < NUM_COMMANDS; i++){
+        free(command_history[i]);
+    }
+    free(command_history);
+}
+
 
 int main () {
     enable_raw_mode(); // switch from canonical to raw mode
+
+    // Need to switch back to canoncial mode when the program exits on its own. Otherwise the terminal get stuck in raw mode
+    if (atexit(disable_raw_mode) != 0){
+        custom_perror("Failed to set exit function.");
+    }
+    
+    // Need to deallocate the allocated memory prior to exiting to avoid memory leaks
+    if (atexit(cleanup) != 0){
+        custom_perror("Failed to set exit function.");
+    }
+
+    // Need to allocate space for the history array. We will support NUM_COMMANDS historical commands, 
+    // and for each historical command, we will support at most BUFFER_SIZE chars
+    command_history = malloc(NUM_COMMANDS * sizeof(char *));
+    if (command_history == NULL){
+        exit(1);
+    }
+
+    for (int i = 0; i < NUM_COMMANDS; i++){
+        command_history[i] = calloc(BUFFER_SIZE, sizeof(char));
+        if (command_history[i] == NULL){
+            exit(1);
+        }
+    }
 
     // For debugging purposes only
     int x = 0;
